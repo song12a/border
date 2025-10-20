@@ -8,3 +8,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Test outputs (keep demo input data but ignore outputs)
+demo/output/*.ply
+demo/output/batch/*.ply

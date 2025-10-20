@@ -30,6 +30,8 @@ This approach is particularly useful for:
 
 - **`create_test_mesh.py`**: Utility to generate test meshes (simple and subdivided cubes)
 
+- **`examples.py`**: Comprehensive examples demonstrating various usage patterns
+
 ## Installation
 
 ### Requirements
@@ -147,6 +149,22 @@ python mesh_simplification_mdd_lme.py
 ```
 
 Check the output in `./demo/output/`
+
+### Running Examples
+
+See various usage examples:
+
+```bash
+python examples.py
+```
+
+This demonstrates:
+1. Basic usage - single file simplification
+2. Programmatic usage - load, simplify, save manually
+3. Comparison with standard QEM
+4. Different partition counts
+5. Batch processing multiple files
+6. Step-by-step component usage
 
 ## Configuration for Windows Paths
 
