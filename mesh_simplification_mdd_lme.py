@@ -19,7 +19,7 @@ from typing import List, Tuple, Dict, Set
 class MeshPartitioner:
     """
     Partitions a mesh into smaller sub-meshes based on spatial subdivision.
-    Implements the MDD (Minimal Simplification Domain) concept.
+    Implements the MDD (Minimal Simplification Domain) concept with 2-ring neighborhood support.
     """
     
     def __init__(self, vertices: np.ndarray, faces: np.ndarray, num_partitions: int = 8):
@@ -36,14 +36,72 @@ class MeshPartitioner:
         self.num_partitions = num_partitions
         self.partitions = []
         self.border_vertices = set()  # Vertices on partition boundaries
+        self.vertex_adjacency = None  # Will store vertex-to-vertex connectivity
+    
+    def build_vertex_adjacency(self) -> Dict[int, Set[int]]:
+        """
+        Build vertex-to-vertex adjacency information from faces.
+        
+        Returns:
+            Dictionary mapping each vertex index to a set of adjacent vertex indices.
+        """
+        adjacency = {i: set() for i in range(len(self.vertices))}
+        
+        for face in self.faces:
+            v0, v1, v2 = face
+            # Each vertex in a triangle is adjacent to the other two
+            adjacency[v0].add(v1)
+            adjacency[v0].add(v2)
+            adjacency[v1].add(v0)
+            adjacency[v1].add(v2)
+            adjacency[v2].add(v0)
+            adjacency[v2].add(v1)
+        
+        return adjacency
+    
+    def compute_n_ring_neighborhood(self, vertex_set: Set[int], n: int = 1) -> Set[int]:
+        """
+        Compute the n-ring neighborhood of a set of vertices.
+        
+        Args:
+            vertex_set: Initial set of vertex indices
+            n: Number of rings to expand (1 for 1-ring, 2 for 2-ring, etc.)
+            
+        Returns:
+            Set of all vertices within n-ring distance from the initial set.
+        """
+        if self.vertex_adjacency is None:
+            self.vertex_adjacency = self.build_vertex_adjacency()
+        
+        current_ring = vertex_set.copy()
+        all_vertices = vertex_set.copy()
+        
+        for _ in range(n):
+            next_ring = set()
+            for vertex in current_ring:
+                # Add all neighbors of vertices in current ring
+                next_ring.update(self.vertex_adjacency[vertex])
+            
+            # Add new vertices to the total set
+            all_vertices.update(next_ring)
+            # Next iteration starts from the newly added vertices
+            current_ring = next_ring - vertex_set  # Exclude original vertices to avoid redundant work
+            vertex_set = all_vertices.copy()  # Update to include all found so far
+        
+        return all_vertices
         
     def partition_octree(self) -> List[Dict]:
         """
-        Partition the mesh using octree spatial subdivision.
+        Partition the mesh using octree spatial subdivision with 2-ring neighborhood support.
+        
+        Each partition includes:
+        - Core vertices: vertices within the spatial bounds
+        - Extended vertices: vertices in the 2-ring neighborhood of core vertices
         
         Returns:
             List of partition dictionaries, each containing:
-                - 'vertices': vertex indices in this partition
+                - 'vertices': all vertex indices in this partition (core + 2-ring)
+                - 'core_vertices': vertex indices in the spatial bounds only
                 - 'faces': face indices in this partition
                 - 'is_border': set of border vertices (shared with other partitions)
         """
@@ -52,7 +110,7 @@ class MeshPartitioner:
         max_coords = np.max(self.vertices, axis=0)
         center = (min_coords + max_coords) / 2
         
-        # Determine which octant each vertex belongs to
+        # Determine which octant each vertex belongs to (based on spatial position)
         vertex_partitions = np.zeros(len(self.vertices), dtype=np.int32)
         
         for i, vertex in enumerate(self.vertices):
@@ -65,29 +123,57 @@ class MeshPartitioner:
                 octant += 4
             vertex_partitions[i] = octant
         
-        # Group faces by their partition
-        # A face belongs to a partition if all its vertices are in that partition
-        # If vertices span multiple partitions, the face is assigned to multiple partitions
-        partition_data = [{'vertices': set(), 'faces': [], 'is_border': set()} 
+        # Initialize partition data structures
+        partition_data = [{'core_vertices': set(), 'vertices': set(), 'faces': [], 'is_border': set()} 
                          for _ in range(8)]
         
+        # First pass: assign vertices to their core partitions based on spatial position
+        for i in range(len(self.vertices)):
+            partition_idx = vertex_partitions[i]
+            partition_data[partition_idx]['core_vertices'].add(i)
+        
+        # Second pass: expand each partition with 2-ring neighborhoods
+        print("  Computing 2-ring neighborhoods for each partition...")
+        for p_idx, p_data in enumerate(partition_data):
+            if len(p_data['core_vertices']) > 0:
+                # Compute 2-ring neighborhood of core vertices
+                extended_vertices = self.compute_n_ring_neighborhood(p_data['core_vertices'], n=2)
+                p_data['vertices'] = extended_vertices
+                print(f"    Partition {p_idx}: {len(p_data['core_vertices'])} core vertices -> "
+                      f"{len(extended_vertices)} vertices with 2-ring")
+        
+        # Third pass: assign faces to partitions
+        # A face belongs to a partition's core if all its vertices are in core or immediate neighbors
+        # A face is in the extended set if it's needed for 2-ring context
         for face_idx, face in enumerate(self.faces):
             v0, v1, v2 = face
-            partitions_for_face = {vertex_partitions[v0], vertex_partitions[v1], vertex_partitions[v2]}
             
-            # If face spans multiple partitions, its vertices are border vertices
-            if len(partitions_for_face) > 1:
+            # Determine which partition's core this face primarily belongs to
+            core_partitions = {vertex_partitions[v0], vertex_partitions[v1], vertex_partitions[v2]}
+            
+            # Assign face to partitions where all vertices are in the extended vertex set
+            for p_idx, p_data in enumerate(partition_data):
+                if v0 in p_data['vertices'] and v1 in p_data['vertices'] and v2 in p_data['vertices']:
+                    p_data['faces'].append(face_idx)
+            
+            # Determine if any vertex is a border vertex
+            # A vertex is on the border if its face spans multiple core partitions
+            if len(core_partitions) > 1:
                 for v in face:
                     self.border_vertices.add(v)
-            
-            # Assign face to all partitions it touches
-            for p in partitions_for_face:
-                partition_data[p]['faces'].append(face_idx)
-                partition_data[p]['vertices'].update(face)
         
-        # Mark border vertices in each partition
+        # Fourth pass: identify border vertices for each partition
+        # Border vertices are those that should not be simplified:
+        # 1. Vertices in the 2-ring extension (not in core)
+        # 2. Vertices on the boundary between core partitions
         for p_idx, p_data in enumerate(partition_data):
-            p_data['is_border'] = p_data['vertices'].intersection(self.border_vertices)
+            for v in p_data['vertices']:
+                # If vertex is not in this partition's core, it's part of the 2-ring extension
+                if v not in p_data['core_vertices']:
+                    p_data['is_border'].add(v)
+                # If vertex is in the core but belongs to a face that spans multiple core partitions
+                elif v in self.border_vertices:
+                    p_data['is_border'].add(v)
         
         # Filter out empty partitions
         self.partitions = [p for p in partition_data if len(p['faces']) > 0]
@@ -246,14 +332,28 @@ class MeshMerger:
         vertex_position_map = {}  # Maps vertex positions to merged indices for tolerance-based matching
         tolerance = 1e-6  # Tolerance for vertex position comparison
         
-        # Process each submesh
+        # First pass: collect all faces and determine which vertices are actually used
+        temp_faces = []
+        used_vertices = set()  # Set of (submesh_idx, local_idx) tuples
+        
+        for submesh_idx, submesh in enumerate(submeshes):
+            faces = submesh['faces']
+            for face in faces:
+                temp_faces.append((submesh_idx, face))
+                for v in face:
+                    used_vertices.add((submesh_idx, v))
+        
+        # Second pass: process only used vertices
         for submesh_idx, submesh in enumerate(submeshes):
             vertices = submesh['vertices']
-            faces = submesh['faces']
             reverse_map = submesh['reverse_map']
             
-            # Process vertices
-            for local_idx, vertex in enumerate(vertices):
+            # Process only vertices that are actually used by faces
+            for local_idx in range(len(vertices)):
+                if (submesh_idx, local_idx) not in used_vertices:
+                    continue  # Skip unused vertices
+                
+                vertex = vertices[local_idx]
                 original_global_idx = reverse_map.get(local_idx)
                 
                 # Check if this vertex was already added from another partition
@@ -278,13 +378,13 @@ class MeshMerger:
                 
                 # Map (submesh_idx, local_idx) to merged_idx
                 self.global_vertex_map[(submesh_idx, local_idx)] = merged_idx
-            
-            # Process faces
-            for face in faces:
-                merged_face = [self.global_vertex_map[(submesh_idx, v)] for v in face]
-                # Check for degenerate faces
-                if len(set(merged_face)) == 3:
-                    self.merged_faces.append(merged_face)
+        
+        # Third pass: process faces
+        for submesh_idx, face in temp_faces:
+            merged_face = [self.global_vertex_map[(submesh_idx, v)] for v in face]
+            # Check for degenerate faces
+            if len(set(merged_face)) == 3:
+                self.merged_faces.append(merged_face)
         
         # Remove duplicate faces (same vertices, regardless of order)
         unique_faces = []
@@ -299,7 +399,8 @@ class MeshMerger:
         merged_faces_array = np.array(unique_faces, dtype=np.int32)
         
         print(f"Merged {len(submeshes)} submeshes:")
-        print(f"  Total vertices before deduplication: {sum(len(s['vertices']) for s in submeshes)}")
+        print(f"  Total vertices in submeshes: {sum(len(s['vertices']) for s in submeshes)}")
+        print(f"  Used vertices before deduplication: {len(used_vertices)}")
         print(f"  Unique vertices after deduplication: {len(merged_vertices_array)}")
         print(f"  Total faces before deduplication: {len(self.merged_faces)}")
         print(f"  Unique faces after deduplication: {len(merged_faces_array)}")
@@ -342,8 +443,8 @@ def simplify_mesh_with_partitioning(
     
     for idx, partition in enumerate(partitions):
         print(f"\nPartition {idx + 1}/{len(partitions)}:")
-        print(f"  Vertices: {len(partition['vertices'])}, Faces: {len(partition['faces'])}")
-        print(f"  Border vertices: {len(partition['is_border'])}")
+        print(f"  Core vertices: {len(partition['core_vertices'])}, Total vertices: {len(partition['vertices'])}")
+        print(f"  Faces: {len(partition['faces'])}, Border vertices: {len(partition['is_border'])}")
         
         # Extract submesh
         submesh_vertices, submesh_faces, vertex_map = partitioner.extract_submesh(partition)
@@ -354,9 +455,38 @@ def simplify_mesh_with_partitioning(
         # Identify border vertices in local indices
         local_border_vertices = {vertex_map[v] for v in partition['is_border'] if v in vertex_map}
         
+        # Identify core vertices in local indices (vertices that belong to this partition's core)
+        local_core_vertices = {vertex_map[v] for v in partition['core_vertices'] if v in vertex_map}
+        
         # Simplify the submesh using LME
         simplifier = LMESimplifier(submesh_vertices, submesh_faces, local_border_vertices)
         simplified_vertices, simplified_faces = simplifier.simplify(target_ratio)
+        
+        # Filter faces to only include those with at least one vertex from the core
+        # This ensures we don't duplicate faces from 2-ring extensions
+        core_faces = []
+        for face in simplified_faces:
+            # Check if any vertex in the face maps back to a core vertex
+            face_has_core_vertex = False
+            for v_idx in face:
+                # Try to find which original vertex this simplified vertex came from
+                min_dist = float('inf')
+                best_orig_local = None
+                for orig_local_idx in range(len(submesh_vertices)):
+                    if v_idx < len(simplified_vertices):
+                        dist = np.linalg.norm(simplified_vertices[v_idx] - submesh_vertices[orig_local_idx])
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_orig_local = orig_local_idx
+                
+                if best_orig_local is not None and min_dist < 1e-5 and best_orig_local in local_core_vertices:
+                    face_has_core_vertex = True
+                    break
+            
+            if face_has_core_vertex:
+                core_faces.append(face)
+        
+        print(f"  Filtered faces: {len(simplified_faces)} -> {len(core_faces)} (core only)")
         
         # Create a reverse map for simplified vertices
         # We need to track which original vertices each simplified vertex came from
@@ -379,10 +509,10 @@ def simplify_mesh_with_partitioning(
             if min_dist < 1e-5:  # Close enough to consider it the same vertex
                 simplified_reverse_map[local_idx] = best_orig_idx
         
-        # Store simplified submesh with mappings
+        # Store simplified submesh with mappings (use core_faces instead of all faces)
         simplified_submeshes.append({
             'vertices': simplified_vertices,
-            'faces': simplified_faces,
+            'faces': core_faces,  # Only include core faces
             'vertex_map': vertex_map,
             'reverse_map': simplified_reverse_map
         })
