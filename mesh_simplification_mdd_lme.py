@@ -311,7 +311,10 @@ class LMESimplifier:
         self.base_simplifier = QEMSimplifier(vertices, faces)
         self.border_vertices = border_vertices
         self.two_ring_extension = two_ring_extension
-        self.border_vertex_mapping = {}  # Maps border vertices before/after simplification
+        
+        # Track which original vertices each vertex represents (for border alignment)
+        # Key: current vertex index, Value: set of original vertex indices it represents
+        self.vertex_lineage = {i: {i} for i in range(len(vertices))}
         
     def simplify(self, target_ratio: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -386,21 +389,16 @@ class LMESimplifier:
             # Track if this involves border vertices for alignment
             border_edge = (v1 in self.border_vertices) or (v2 in self.border_vertices)
             
+            # Before contraction, track vertex lineage (v2 merges into v1)
+            if v2 in self.vertex_lineage:
+                if v1 not in self.vertex_lineage:
+                    self.vertex_lineage[v1] = {v1}
+                # v1 now represents all vertices that v2 represented, plus itself
+                self.vertex_lineage[v1].update(self.vertex_lineage[v2])
+                del self.vertex_lineage[v2]
+            
             # Contract edge
             self.base_simplifier.contract_edge(v1, v2, optimal_pos)
-            
-            # Update border vertex mapping if needed
-            if border_edge:
-                # v2 is contracted into v1, so update mapping
-                if v2 in self.border_vertex_mapping:
-                    # v2 was a border vertex, now it maps to v1
-                    old_mapping = self.border_vertex_mapping[v2]
-                    self.border_vertex_mapping[v2] = v1
-                    if v1 in self.border_vertex_mapping:
-                        # v1 is also border, keep track of the chain
-                        for key, val in self.border_vertex_mapping.items():
-                            if val == v2:
-                                self.border_vertex_mapping[key] = v1
             
             contraction_count += 1
             current_vertex_count = len(self.base_simplifier.valid_vertices)
@@ -414,64 +412,112 @@ class LMESimplifier:
         print(f"  Simplification complete: {len(self.base_simplifier.vertices)} vertices, "
               f"{len(self.base_simplifier.faces)} faces")
         
-        return self.base_simplifier.vertices, self.base_simplifier.faces
+        # Return vertices, faces, and vertex lineage for boundary alignment
+        return self.base_simplifier.vertices, self.base_simplifier.faces, self.vertex_lineage
 
 
 class BoundaryAligner:
     """
     Aligns boundaries between simplified partitions as per the paper.
+    Uses position-based matching with tolerance to handle simplified border vertices.
     """
     
     @staticmethod
     def align_boundaries(submeshes: List[Dict], original_vertices: np.ndarray, 
-                        border_vertices_global: Set[int]) -> List[Dict]:
+                        border_vertices_global: Set[int], tolerance: float = 1e-4) -> List[Dict]:
         """
         Align boundaries between partitions after simplification.
+        Uses position-based clustering to group border vertices that should be aligned.
         
         Args:
             submeshes: List of simplified submeshes
             original_vertices: Original mesh vertices
             border_vertices_global: Global border vertices set
+            tolerance: Distance tolerance for considering vertices as the same (default: 1e-4)
             
         Returns:
             List of submeshes with aligned boundaries
         """
         print("  Aligning boundaries between partitions...")
         
-        # Build a mapping of border vertices across partitions
-        # Key: original global vertex index, Value: list of (submesh_idx, local_idx, position)
-        border_vertex_instances = {}
+        # Collect all border vertices from all submeshes
+        # Format: [(submesh_idx, local_idx, position, set of original_global_indices)]
+        all_border_candidates = []
         
         for submesh_idx, submesh in enumerate(submeshes):
             vertices = submesh['vertices']
+            lineage_map = submesh.get('lineage_map', {})
             reverse_map = submesh.get('reverse_map', {})
             
             for local_idx, vertex in enumerate(vertices):
-                # Check if this corresponds to a border vertex in the original mesh
-                original_global_idx = reverse_map.get(local_idx)
-                if original_global_idx is not None and original_global_idx in border_vertices_global:
-                    if original_global_idx not in border_vertex_instances:
-                        border_vertex_instances[original_global_idx] = []
-                    border_vertex_instances[original_global_idx].append(
-                        (submesh_idx, local_idx, vertex.copy())
+                # Get all original vertices this simplified vertex represents
+                original_indices = lineage_map.get(local_idx, set())
+                if len(original_indices) == 0:
+                    # Fallback to reverse_map if lineage not available
+                    orig_idx = reverse_map.get(local_idx)
+                    if orig_idx is not None:
+                        original_indices = {orig_idx}
+                
+                # Check if any of the represented vertices are border vertices
+                border_indices = original_indices & border_vertices_global
+                if len(border_indices) > 0:
+                    all_border_candidates.append(
+                        (submesh_idx, local_idx, vertex.copy(), border_indices)
                     )
         
-        # For each border vertex that appears in multiple partitions, 
-        # compute average position and update all instances
-        alignment_count = 0
-        for original_idx, instances in border_vertex_instances.items():
-            if len(instances) > 1:
-                # Compute average position
-                positions = [inst[2] for inst in instances]
-                avg_position = np.mean(positions, axis=0)
-                
-                # Update all instances to use the average position
-                for submesh_idx, local_idx, _ in instances:
-                    submeshes[submesh_idx]['vertices'][local_idx] = avg_position
-                
-                alignment_count += 1
+        # Use both lineage and position-based clustering to group vertices that should be aligned
+        # This handles cases where edge contractions have moved border vertices
+        aligned_groups = []
+        processed = set()
         
-        print(f"    Aligned {alignment_count} border vertices across partitions")
+        for i, (submesh_i, local_i, pos_i, border_set_i) in enumerate(all_border_candidates):
+            if i in processed:
+                continue
+            
+            # Start a new group with this vertex
+            group = [(submesh_i, local_i, pos_i)]
+            processed.add(i)
+            
+            # Find all other vertices that should be aligned with this one
+            for j, (submesh_j, local_j, pos_j, border_set_j) in enumerate(all_border_candidates):
+                if j in processed:
+                    continue
+                
+                # Check if vertices share any original border vertices (via lineage)
+                # OR are within tolerance distance (spatial proximity)
+                shares_lineage = len(border_set_i & border_set_j) > 0
+                dist = np.linalg.norm(pos_i - pos_j)
+                close_enough = dist < tolerance
+                
+                if shares_lineage or close_enough:
+                    group.append((submesh_j, local_j, pos_j))
+                    processed.add(j)
+                    # Update border_set_i to include j's borders for transitive matching
+                    border_set_i |= border_set_j
+            
+            # Only align if vertex appears in multiple partitions
+            unique_submeshes = set(item[0] for item in group)
+            if len(unique_submeshes) > 1:
+                aligned_groups.append(group)
+        
+        # Align each group by computing average position
+        alignment_count = 0
+        total_vertices_aligned = 0
+        
+        for group in aligned_groups:
+            # Compute average position
+            positions = [item[2] for item in group]
+            avg_position = np.mean(positions, axis=0)
+            
+            # Update all vertices in the group to use average position
+            for submesh_idx, local_idx, _ in group:
+                submeshes[submesh_idx]['vertices'][local_idx] = avg_position
+            
+            alignment_count += 1
+            total_vertices_aligned += len(group)
+        
+        print(f"    Aligned {alignment_count} groups ({total_vertices_aligned} vertex instances) across partitions")
+        print(f"    Tolerance: {tolerance}")
         
         return submeshes
 
@@ -641,7 +687,7 @@ def simplify_mesh_with_partitioning(
         # Simplify the submesh using LME with boundary simplification enabled
         simplifier = LMESimplifier(submesh_vertices, submesh_faces, 
                                    local_border_vertices, local_two_ring_extension)
-        simplified_vertices, simplified_faces = simplifier.simplify(target_ratio)
+        simplified_vertices, simplified_faces, vertex_lineage = simplifier.simplify(target_ratio)
         
         # Filter faces to only include those with at least one vertex from the core
         # This ensures we don't duplicate faces from 2-ring extensions
@@ -669,33 +715,56 @@ def simplify_mesh_with_partitioning(
         
         print(f"  Filtered faces: {len(simplified_faces)} -> {len(core_faces)} (core only)")
         
-        # Create a reverse map for simplified vertices
-        # We need to track which original vertices each simplified vertex came from
+        # Create a reverse map for simplified vertices using vertex lineage
+        # This tracks which original global vertices each simplified vertex represents
         simplified_reverse_map = {}
-        for local_idx in range(len(simplified_vertices)):
-            # For now, we'll try to map back based on position matching
-            # This is approximate but necessary since simplification changes vertex count
-            simplified_reverse_map[local_idx] = None
+        simplified_lineage_map = {}  # Maps simplified local idx to set of original global indices
         
-        # Try to match simplified vertices back to original vertices by position
-        for local_idx, simp_vert in enumerate(simplified_vertices):
+        # After rebuild_mesh, we need to map from the old local indices (used in lineage)
+        # to the new local indices in simplified_vertices
+        # The rebuild_mesh creates a mapping from old to new indices
+        old_to_new_map = {}
+        for new_idx in range(len(simplified_vertices)):
+            # Find which old index this corresponds to by position matching
+            best_old_idx = None
             min_dist = float('inf')
-            best_orig_idx = None
-            for orig_local_idx, orig_global_idx in reverse_map.items():
-                if orig_local_idx < len(submesh_vertices):
-                    dist = np.linalg.norm(simp_vert - submesh_vertices[orig_local_idx])
+            for old_idx in vertex_lineage.keys():
+                if old_idx < len(submesh_vertices):
+                    dist = np.linalg.norm(simplified_vertices[new_idx] - submesh_vertices[old_idx])
                     if dist < min_dist:
                         min_dist = dist
-                        best_orig_idx = orig_global_idx
-            if min_dist < 1e-5:  # Close enough to consider it the same vertex
-                simplified_reverse_map[local_idx] = best_orig_idx
+                        best_old_idx = old_idx
+            
+            if best_old_idx is not None and min_dist < 1e-5:
+                old_to_new_map[best_old_idx] = new_idx
+        
+        # Now create the reverse maps using vertex lineage
+        for new_idx in range(len(simplified_vertices)):
+            simplified_reverse_map[new_idx] = None
+            simplified_lineage_map[new_idx] = set()
+            
+            # Find the old index this new index came from
+            for old_idx, mapped_new_idx in old_to_new_map.items():
+                if mapped_new_idx == new_idx and old_idx in vertex_lineage:
+                    # Get all original vertices this represents
+                    original_local_indices = vertex_lineage[old_idx]
+                    # Convert to global indices
+                    for orig_local in original_local_indices:
+                        if orig_local in reverse_map:
+                            simplified_lineage_map[new_idx].add(reverse_map[orig_local])
+                    
+                    # For reverse_map, pick the first one (for backward compatibility)
+                    if len(simplified_lineage_map[new_idx]) > 0:
+                        simplified_reverse_map[new_idx] = min(simplified_lineage_map[new_idx])
+                    break
         
         # Store simplified submesh with mappings (use core_faces instead of all faces)
         simplified_submeshes.append({
             'vertices': simplified_vertices,
             'faces': core_faces,  # Only include core faces
             'vertex_map': vertex_map,
-            'reverse_map': simplified_reverse_map
+            'reverse_map': simplified_reverse_map,
+            'lineage_map': simplified_lineage_map  # Set of all original vertices represented
         })
     
     # Step 2.5: Align boundaries between partitions
