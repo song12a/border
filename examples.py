@@ -28,7 +28,7 @@ def example_2_programmatic_usage():
     input_dir = r"D:\sxl08\rand1\neural-mesh-simplification\neural-mesh-simplification\demo\data"  # 输入PLY文件所在目录
     output_dir = r"D:\sxl08\rand1\neural-mesh-simplification\neural-mesh-simplification\demo\output"  # 输出目录
     target_ratio = 0.4  # 保留40%顶点
-    num_partitions = 8  # 八叉树分区数量
+    target_edges_per_partition = 200  # 每个分区目标边数
 
     # 创建输出目录（如果不存在）
     os.makedirs(output_dir, exist_ok=True)
@@ -41,7 +41,7 @@ def example_2_programmatic_usage():
         return
 
     print(f"\nFound {len(ply_files)} PLY files in {input_dir}")
-    print(f"Processing with target ratio: {target_ratio}, partitions: {num_partitions}\n")
+    print(f"Processing with target ratio: {target_ratio}, target edges per partition: {target_edges_per_partition}\n")
 
     # 批量处理每个PLY文件
     for filename in ply_files:
@@ -61,7 +61,7 @@ def example_2_programmatic_usage():
                 vertices,
                 faces,
                 target_ratio=target_ratio,
-                num_partitions=num_partitions
+                target_edges_per_partition=target_edges_per_partition
             )
 
             # 保存简化结果
@@ -77,12 +77,12 @@ def example_2_programmatic_usage():
 
 
 
-def example_4_different_partition_counts():
+def example_4_different_edge_counts():
     """
-    Example 4: Test different numbers of partitions.
+    Example 4: Test different edge counts per partition.
     """
     print("\n" + "=" * 70)
-    print("Example 4: Different Partition Counts")
+    print("Example 4: Different Edge Counts Per Partition")
     print("=" * 70)
     
     input_file = "demo/data/cube_subdivided.ply"
@@ -90,13 +90,13 @@ def example_4_different_partition_counts():
     
     print(f"\nOriginal mesh: {len(vertices)} vertices, {len(faces)} faces")
     
-    # Try different partition counts
-    for num_parts in [8]:  # Could also try [1, 4, 8, 16, 27] for larger meshes
-        print(f"\n--- Using {num_parts} partitions ---")
+    # Try different edge counts per partition
+    for target_edges in [50, 100, 200]:  # Different partition sizes
+        print(f"\n--- Target {target_edges} edges per partition ---")
         simplified_vertices, simplified_faces = simplify_mesh_with_partitioning(
-            vertices, faces, target_ratio=0.5, num_partitions=num_parts
+            vertices, faces, target_ratio=0.5, target_edges_per_partition=target_edges
         )
-        output_file = f"demo/output/example4_parts_{num_parts}.ply"
+        output_file = f"demo/output/example4_edges_{target_edges}.ply"
         PLYWriter.write_ply(output_file, simplified_vertices, simplified_faces)
 
 
