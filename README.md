@@ -1,12 +1,12 @@
 # Mesh Simplification with MDD and LME
 
-This repository implements a mesh simplification algorithm based on the concepts of **MDD (Minimal Simplification Domain)** and **LME (Local Minimal Edges)** from the paper on out-of-core mesh simplification.
+This repository implements a mesh simplification algorithm based on the concepts of **MDD (Minimal Simplification Domain)** and **LME (Local Minimal Edges)** from the paper on out-of-core mesh simplification, with support for **2-ring neighborhoods** for accurate QEM-based simplification.
 
 ## Overview
 
 The implementation provides a modular approach to mesh simplification that:
 
-1. **Partitions** large meshes into smaller sub-meshes (MDD - Minimal Simplification Domain)
+1. **Partitions** large meshes into smaller sub-meshes (MDD - Minimal Simplification Domain) with 2-ring neighborhood support
 2. **Simplifies** each sub-mesh independently using QEM with border preservation (LME - Local Minimal Edges)
 3. **Merges** the simplified sub-meshes back into a single coherent output mesh
 
@@ -14,6 +14,20 @@ This approach is particularly useful for:
 - Processing very large meshes that don't fit in memory
 - Parallel simplification of mesh partitions
 - Preserving geometric details at partition boundaries
+- Ensuring accurate QEM calculations with topological context
+
+## Key Features
+
+### 2-Ring Neighborhood Support
+
+The implementation now includes topology-based 2-ring neighborhood calculation for each partition:
+
+- **Core Vertices**: Vertices within the spatial bounds of a partition
+- **2-Ring Extension**: Vertices within 2 edges of the core vertices
+- **Accurate QEM**: The 2-ring provides sufficient topological context for accurate quadric error metric calculations
+- **Border Preservation**: Vertices in the 2-ring extension are preserved during simplification to maintain mesh coherence
+
+This satisfies the requirements of the Minimal Simplification Domain (MDD) as described in the paper "Out-of-Core Framework for QEM-based Mesh Simplification."
 
 ## Files
 
@@ -22,8 +36,8 @@ This approach is particularly useful for:
   - `PLYWriter`: Write PLY mesh files (ASCII format)
   - `QEMSimplifier`: Core QEM simplification algorithm
 
-- **`mesh_simplification_mdd_lme.py`**: Main implementation of MDD/LME simplification
-  - `MeshPartitioner`: Partitions meshes using octree spatial subdivision
+- **`mesh_simplification_mdd_lme.py`**: Main implementation of MDD/LME simplification with 2-ring neighborhoods
+  - `MeshPartitioner`: Partitions meshes using octree spatial subdivision with 2-ring neighborhood support
   - `LMESimplifier`: Extends QEM to preserve border vertices
   - `MeshMerger`: Merges simplified sub-meshes with deduplication
   - Command-line interface for processing PLY files
@@ -31,6 +45,8 @@ This approach is particularly useful for:
 - **`create_test_mesh.py`**: Utility to generate test meshes (simple and subdivided cubes)
 
 - **`examples.py`**: Comprehensive examples demonstrating various usage patterns
+
+- **`test_2ring_neighborhood.py`**: Test suite for validating 2-ring neighborhood implementation
 
 ## Installation
 
@@ -96,29 +112,53 @@ PLYWriter.write_ply("output.ply", simplified_vertices, simplified_faces)
 
 ## Algorithm Details
 
-### 1. Mesh Partitioning (MDD)
+### 1. Mesh Partitioning (MDD) with 2-Ring Neighborhoods
 
-The mesh is partitioned using **octree spatial subdivision**:
+The mesh is partitioned using **octree spatial subdivision** with 2-ring neighborhood expansion:
 
+#### Phase 1: Core Partitioning
 - The bounding box of the mesh is divided into 8 octants
-- Each vertex is assigned to an octant based on its position
-- Faces are assigned to all octants they touch
+- Each vertex is assigned to an octant based on its spatial position
+- These vertices form the "core" of each partition
+
+#### Phase 2: Topology-Based Expansion
+- For each partition, compute the 2-ring neighborhood of core vertices
+- **1-ring**: All vertices directly connected by an edge to core vertices
+- **2-ring**: All vertices connected to the 1-ring vertices
+- The extended vertex set includes both core and 2-ring vertices
+
+#### Phase 3: Face Assignment
+- Faces are assigned to partitions if all their vertices are in the extended vertex set
 - Vertices on partition boundaries are marked as **border vertices**
 
-This creates smaller, independent sub-meshes that can be simplified separately.
+This creates smaller, independent sub-meshes with sufficient topological context for accurate QEM simplification.
+
+### Why 2-Ring Neighborhoods?
+
+The 2-ring neighborhood is essential for accurate QEM-based mesh simplification:
+
+1. **Quadric Error Calculation**: The quadric error matrix for a vertex depends on adjacent faces. The 2-ring ensures all necessary face information is available.
+
+2. **Edge Collapse Context**: When collapsing an edge, the optimal position calculation requires information about neighboring vertices and faces.
+
+3. **Coherent Simplification**: The 2-ring provides enough context to make simplification decisions that are consistent with the global mesh structure.
+
+4. **MDD Requirement**: The paper "Out-of-Core Framework for QEM-based Mesh Simplification" specifies 2-ring neighborhoods as a requirement for minimal simplification domains.
 
 ### 2. Local Simplification (LME)
 
 Each sub-mesh is simplified using the **QEM (Quadric Error Metric)** method with border preservation:
 
-- **Border vertices** (shared between partitions) are preserved
-- Only **interior vertices** are simplified through edge collapse
+- **Border vertices** (including 2-ring extension vertices) are preserved
+- Only **core interior vertices** are simplified through edge collapse
 - This ensures that partition boundaries remain compatible for merging
+- The 2-ring context ensures accurate quadric error calculations
 
 The QEM method:
-- Computes a quadric error matrix for each vertex
+- Computes a quadric error matrix for each vertex based on adjacent faces
 - Iteratively collapses edges with minimal error
 - Finds optimal vertex positions that minimize geometric distortion
+- Benefits from 2-ring context for more accurate error estimation
 
 ### 3. Sub-mesh Merging
 
@@ -131,6 +171,25 @@ The simplified sub-meshes are merged back together:
 - The result is a single, coherent simplified mesh
 
 ## Testing
+
+### Running Tests
+
+The repository includes a comprehensive test suite for validating the 2-ring neighborhood implementation:
+
+```bash
+python test_2ring_neighborhood.py
+```
+
+The test suite validates:
+1. **Vertex Adjacency**: Topology-based adjacency graph construction
+2. **1-Ring Neighborhoods**: Direct neighbor calculation
+3. **2-Ring Neighborhoods**: Two-hop neighbor calculation
+4. **Partition Expansion**: Core vertices correctly expanded with 2-ring
+5. **Border Classification**: Border vertices correctly identified
+6. **Mesh Coherence**: Simplified mesh is valid and coherent
+7. **Simplification Quality**: Output meets quality expectations
+
+### Test Meshes
 
 Generate test meshes:
 
