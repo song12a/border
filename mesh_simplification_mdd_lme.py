@@ -18,25 +18,26 @@ from typing import List, Tuple, Dict, Set
 
 class MeshPartitioner:
     """
-    Partitions a mesh into smaller sub-meshes based on spatial subdivision.
+    Partitions a mesh into smaller sub-meshes based on edge count.
     Implements the MDD (Minimal Simplification Domain) concept with 2-ring neighborhood support.
     """
     
-    def __init__(self, vertices: np.ndarray, faces: np.ndarray, num_partitions: int = 8):
+    def __init__(self, vertices: np.ndarray, faces: np.ndarray, target_edges_per_partition: int = 200):
         """
         Initialize the mesh partitioner.
         
         Args:
             vertices: Array of vertex coordinates (N x 3)
             faces: Array of face indices (M x 3)
-            num_partitions: Number of spatial partitions (default: 8 for octree)
+            target_edges_per_partition: Target number of edges per partition (default: 200)
         """
         self.vertices = vertices
         self.faces = faces
-        self.num_partitions = num_partitions
+        self.target_edges_per_partition = target_edges_per_partition
         self.partitions = []
         self.border_vertices = set()  # Vertices on partition boundaries
         self.vertex_adjacency = None  # Will store vertex-to-vertex connectivity
+        self.edge_set = None  # Will store all edges in the mesh
     
     def build_vertex_adjacency(self) -> Dict[int, Set[int]]:
         """
@@ -58,6 +59,22 @@ class MeshPartitioner:
             adjacency[v2].add(v1)
         
         return adjacency
+    
+    def build_edge_set(self) -> Set[Tuple[int, int]]:
+        """
+        Build a set of all edges in the mesh.
+        
+        Returns:
+            Set of edges, where each edge is a tuple (min_vertex, max_vertex).
+        """
+        edges = set()
+        for face in self.faces:
+            v0, v1, v2 = face
+            # Add the three edges of the triangle
+            edges.add((min(v0, v1), max(v0, v1)))
+            edges.add((min(v1, v2), max(v1, v2)))
+            edges.add((min(v2, v0), max(v2, v0)))
+        return edges
     
     def compute_n_ring_neighborhood(self, vertex_set: Set[int], n: int = 1) -> Set[int]:
         """
@@ -90,93 +107,155 @@ class MeshPartitioner:
         
         return all_vertices
         
-    def partition_octree(self) -> List[Dict]:
+    def partition_by_edge_count(self) -> List[Dict]:
         """
-        Partition the mesh using octree spatial subdivision with 2-ring neighborhood support.
+        Partition the mesh based on target edge count with 2-ring neighborhood support.
+        Uses region growing to create partitions with approximately target_edges_per_partition edges.
         
         Each partition includes:
-        - Core vertices: vertices within the spatial bounds
+        - Core vertices: vertices in the partition
         - Extended vertices: vertices in the 2-ring neighborhood of core vertices
         
         Returns:
             List of partition dictionaries, each containing:
                 - 'vertices': all vertex indices in this partition (core + 2-ring)
-                - 'core_vertices': vertex indices in the spatial bounds only
+                - 'core_vertices': vertex indices in the core partition
                 - 'faces': face indices in this partition
                 - 'is_border': set of border vertices (shared with other partitions)
         """
-        # Calculate bounding box
-        min_coords = np.min(self.vertices, axis=0)
-        max_coords = np.max(self.vertices, axis=0)
-        center = (min_coords + max_coords) / 2
+        # Build adjacency and edge information
+        if self.vertex_adjacency is None:
+            self.vertex_adjacency = self.build_vertex_adjacency()
+        if self.edge_set is None:
+            self.edge_set = self.build_edge_set()
         
-        # Determine which octant each vertex belongs to (based on spatial position)
-        vertex_partitions = np.zeros(len(self.vertices), dtype=np.int32)
-        
-        for i, vertex in enumerate(self.vertices):
-            octant = 0
-            if vertex[0] > center[0]:
-                octant += 1
-            if vertex[1] > center[1]:
-                octant += 2
-            if vertex[2] > center[2]:
-                octant += 4
-            vertex_partitions[i] = octant
-        
-        # Initialize partition data structures
-        partition_data = [{'core_vertices': set(), 'vertices': set(), 'faces': [], 'is_border': set()} 
-                         for _ in range(8)]
-        
-        # First pass: assign vertices to their core partitions based on spatial position
-        for i in range(len(self.vertices)):
-            partition_idx = vertex_partitions[i]
-            partition_data[partition_idx]['core_vertices'].add(i)
-        
-        # Second pass: expand each partition with 2-ring neighborhoods
-        print("  Computing 2-ring neighborhoods for each partition...")
-        for p_idx, p_data in enumerate(partition_data):
-            if len(p_data['core_vertices']) > 0:
-                # Compute 2-ring neighborhood of core vertices
-                extended_vertices = self.compute_n_ring_neighborhood(p_data['core_vertices'], n=2)
-                p_data['vertices'] = extended_vertices
-                print(f"    Partition {p_idx}: {len(p_data['core_vertices'])} core vertices -> "
-                      f"{len(extended_vertices)} vertices with 2-ring")
-        
-        # Third pass: assign faces to partitions
-        # A face belongs to a partition's core if all its vertices are in core or immediate neighbors
-        # A face is in the extended set if it's needed for 2-ring context
+        # Build face-to-vertex mapping
+        vertex_faces = {i: [] for i in range(len(self.vertices))}
         for face_idx, face in enumerate(self.faces):
-            v0, v1, v2 = face
-            
-            # Determine which partition's core this face primarily belongs to
-            core_partitions = {vertex_partitions[v0], vertex_partitions[v1], vertex_partitions[v2]}
-            
-            # Assign face to partitions where all vertices are in the extended vertex set
-            for p_idx, p_data in enumerate(partition_data):
-                if v0 in p_data['vertices'] and v1 in p_data['vertices'] and v2 in p_data['vertices']:
-                    p_data['faces'].append(face_idx)
-            
-            # Determine if any vertex is a border vertex
-            # A vertex is on the border if its face spans multiple core partitions
-            if len(core_partitions) > 1:
-                for v in face:
-                    self.border_vertices.add(v)
+            for v in face:
+                vertex_faces[v].append(face_idx)
         
-        # Fourth pass: identify border vertices for each partition
-        # Border vertices are those that should not be simplified:
-        # 1. Vertices in the 2-ring extension (not in core)
-        # 2. Vertices on the boundary between core partitions
+        # Track which faces have been assigned to partitions
+        assigned_faces = set()
+        partition_data = []
+        
+        print(f"  Partitioning mesh with target {self.target_edges_per_partition} edges per partition...")
+        print(f"  Total edges in mesh: {len(self.edge_set)}")
+        
+        while len(assigned_faces) < len(self.faces):
+            # Find an unassigned face to start a new partition
+            seed_face = None
+            for face_idx in range(len(self.faces)):
+                if face_idx not in assigned_faces:
+                    seed_face = face_idx
+                    break
+            
+            if seed_face is None:
+                break
+            
+            # Grow partition from seed face using region growing
+            core_vertices = set(self.faces[seed_face])
+            core_faces = {seed_face}
+            assigned_faces.add(seed_face)
+            
+            # Count edges in current partition
+            def count_edges_in_partition(vertices_set):
+                edge_count = 0
+                for v1, v2 in self.edge_set:
+                    if v1 in vertices_set and v2 in vertices_set:
+                        edge_count += 1
+                return edge_count
+            
+            # Frontier: faces adjacent to current partition
+            frontier = set()
+            for v in core_vertices:
+                for f_idx in vertex_faces[v]:
+                    if f_idx not in assigned_faces and f_idx not in core_faces:
+                        frontier.add(f_idx)
+            
+            # Grow partition until target edge count is reached
+            while len(frontier) > 0:
+                current_edge_count = count_edges_in_partition(core_vertices)
+                
+                # Check if we've reached target edge count (with some tolerance)
+                if current_edge_count >= self.target_edges_per_partition * 0.8:
+                    # Don't exceed target by too much
+                    if current_edge_count >= self.target_edges_per_partition * 1.2:
+                        break
+                
+                # Find the best face to add from frontier
+                # Choose face that shares most vertices with current partition
+                best_face = None
+                best_shared_vertices = 0
+                
+                for f_idx in frontier:
+                    face = self.faces[f_idx]
+                    shared = sum(1 for v in face if v in core_vertices)
+                    if shared > best_shared_vertices:
+                        best_shared_vertices = shared
+                        best_face = f_idx
+                
+                if best_face is None:
+                    break
+                
+                # Add the best face to partition
+                face = self.faces[best_face]
+                core_vertices.update(face)
+                core_faces.add(best_face)
+                assigned_faces.add(best_face)
+                frontier.remove(best_face)
+                
+                # Update frontier
+                for v in face:
+                    for f_idx in vertex_faces[v]:
+                        if f_idx not in assigned_faces and f_idx not in core_faces:
+                            frontier.add(f_idx)
+            
+            # Create partition with 2-ring neighborhood
+            extended_vertices = self.compute_n_ring_neighborhood(core_vertices, n=2)
+            
+            # Find all faces that are fully contained in extended vertices
+            partition_faces = []
+            for face_idx, face in enumerate(self.faces):
+                if all(v in extended_vertices for v in face):
+                    partition_faces.append(face_idx)
+            
+            edge_count = count_edges_in_partition(core_vertices)
+            
+            partition = {
+                'core_vertices': core_vertices,
+                'vertices': extended_vertices,
+                'faces': partition_faces,
+                'is_border': set()  # Will be filled later
+            }
+            partition_data.append(partition)
+            
+            print(f"    Partition {len(partition_data)}: {len(core_vertices)} core vertices, "
+                  f"{len(extended_vertices)} total vertices (2-ring), {edge_count} edges, {len(partition_faces)} faces")
+        
+        # Identify border vertices (vertices shared between core partitions)
+        vertex_partition_count = {i: 0 for i in range(len(self.vertices))}
+        for p in partition_data:
+            for v in p['core_vertices']:
+                vertex_partition_count[v] += 1
+        
+        for v, count in vertex_partition_count.items():
+            if count > 1:
+                self.border_vertices.add(v)
+        
+        # Mark border vertices in each partition
         for p_idx, p_data in enumerate(partition_data):
             for v in p_data['vertices']:
                 # If vertex is not in this partition's core, it's part of the 2-ring extension
                 if v not in p_data['core_vertices']:
                     p_data['is_border'].add(v)
-                # If vertex is in the core but belongs to a face that spans multiple core partitions
+                # If vertex is in the core but belongs to multiple partitions
                 elif v in self.border_vertices:
                     p_data['is_border'].add(v)
         
-        # Filter out empty partitions
-        self.partitions = [p for p in partition_data if len(p['faces']) > 0]
+        self.partitions = partition_data
+        print(f"  Created {len(partition_data)} partitions")
+        print(f"  Border vertices: {len(self.border_vertices)}")
         
         return self.partitions
     
@@ -214,24 +293,30 @@ class MeshPartitioner:
 
 class LMESimplifier:
     """
-    Local Minimal Edges (LME) Simplifier that extends QEM to preserve border vertices.
+    Local Minimal Edges (LME) Simplifier that extends QEM to simplify meshes including boundaries.
+    Implements boundary simplification with subsequent boundary alignment as per the paper.
     """
     
-    def __init__(self, vertices: np.ndarray, faces: np.ndarray, border_vertices: Set[int]):
+    def __init__(self, vertices: np.ndarray, faces: np.ndarray, border_vertices: Set[int], 
+                 two_ring_extension: Set[int]):
         """
         Initialize the LME simplifier.
         
         Args:
             vertices: Array of vertex coordinates
             faces: Array of face indices
-            border_vertices: Set of vertex indices that are on partition borders
+            border_vertices: Set of vertex indices that are on partition borders (can be simplified)
+            two_ring_extension: Set of vertex indices in 2-ring extension (should not be simplified)
         """
         self.base_simplifier = QEMSimplifier(vertices, faces)
         self.border_vertices = border_vertices
+        self.two_ring_extension = two_ring_extension
+        self.border_vertex_mapping = {}  # Maps border vertices before/after simplification
         
     def simplify(self, target_ratio: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Simplify the mesh while preserving border vertices.
+        Simplify the mesh including boundary vertices, following the paper's approach.
+        Only 2-ring extension vertices are preserved.
         
         Args:
             target_ratio: Target ratio of vertices to retain
@@ -239,29 +324,32 @@ class LMESimplifier:
         Returns:
             Tuple of (simplified_vertices, simplified_faces)
         """
-        # Calculate target vertex count, ensuring border vertices are preserved
-        num_border = len(self.border_vertices)
+        # Calculate target vertex count
+        # Only 2-ring extension vertices are protected, border vertices can be simplified
+        num_protected = len(self.two_ring_extension)
         num_total = len(self.base_simplifier.vertices)
-        num_interior = num_total - num_border
+        num_simplifiable = num_total - num_protected
         
-        # We want to keep all border vertices plus a fraction of interior vertices
-        target_interior = max(4, int(num_interior * target_ratio))
-        target_vertex_count = num_border + target_interior
+        # Target: keep all protected vertices plus a fraction of simplifiable vertices
+        target_simplifiable = max(4, int(num_simplifiable * target_ratio))
+        target_vertex_count = num_protected + target_simplifiable
         
-        print(f"  LME Simplification: {num_total} vertices ({num_border} border, {num_interior} interior)")
-        print(f"  Target: {target_vertex_count} vertices ({num_border} border, {target_interior} interior)")
+        print(f"  LME Simplification: {num_total} vertices ({num_protected} protected 2-ring, "
+              f"{len(self.border_vertices)} border, {num_simplifiable - len(self.border_vertices)} interior)")
+        print(f"  Target: {target_vertex_count} vertices ({num_protected} protected, {target_simplifiable} simplifiable)")
         
         # Find all valid edges
         edges = self.base_simplifier.find_valid_edges()
         
-        # Create priority queue, excluding edges involving border vertices
+        # Create priority queue
+        # Exclude edges involving 2-ring extension vertices only
         import heapq
         heap = []
         
         for edge in edges:
             v1, v2 = edge
-            # Skip edges involving border vertices
-            if v1 in self.border_vertices or v2 in self.border_vertices:
+            # Skip edges involving 2-ring extension vertices (these are truly protected)
+            if v1 in self.two_ring_extension or v2 in self.two_ring_extension:
                 continue
             
             if v1 not in self.base_simplifier.valid_vertices or v2 not in self.base_simplifier.valid_vertices:
@@ -269,7 +357,16 @@ class LMESimplifier:
             
             optimal_pos = self.base_simplifier.compute_optimal_position(v1, v2)
             cost = self.base_simplifier.compute_cost(v1, v2, optimal_pos)
+            
+            # Prioritize interior edges over boundary edges
+            # Boundary edges get a small penalty to prefer interior simplification first
+            if v1 in self.border_vertices or v2 in self.border_vertices:
+                cost *= 1.1  # Small penalty for boundary edges
+            
             heapq.heappush(heap, (cost, v1, v2, optimal_pos))
+        
+        # Track border vertex movements for later alignment
+        self.border_vertex_mapping = {v: v for v in self.border_vertices}
         
         # Perform edge contractions
         contraction_count = 0
@@ -282,12 +379,29 @@ class LMESimplifier:
             if v1 not in self.base_simplifier.valid_vertices or v2 not in self.base_simplifier.valid_vertices:
                 continue
             
-            # Double-check border vertices (shouldn't happen but safety check)
-            if v1 in self.border_vertices or v2 in self.border_vertices:
+            # Double-check 2-ring extension vertices (shouldn't happen but safety check)
+            if v1 in self.two_ring_extension or v2 in self.two_ring_extension:
                 continue
+            
+            # Track if this involves border vertices for alignment
+            border_edge = (v1 in self.border_vertices) or (v2 in self.border_vertices)
             
             # Contract edge
             self.base_simplifier.contract_edge(v1, v2, optimal_pos)
+            
+            # Update border vertex mapping if needed
+            if border_edge:
+                # v2 is contracted into v1, so update mapping
+                if v2 in self.border_vertex_mapping:
+                    # v2 was a border vertex, now it maps to v1
+                    old_mapping = self.border_vertex_mapping[v2]
+                    self.border_vertex_mapping[v2] = v1
+                    if v1 in self.border_vertex_mapping:
+                        # v1 is also border, keep track of the chain
+                        for key, val in self.border_vertex_mapping.items():
+                            if val == v2:
+                                self.border_vertex_mapping[key] = v1
+            
             contraction_count += 1
             current_vertex_count = len(self.base_simplifier.valid_vertices)
             
@@ -301,6 +415,65 @@ class LMESimplifier:
               f"{len(self.base_simplifier.faces)} faces")
         
         return self.base_simplifier.vertices, self.base_simplifier.faces
+
+
+class BoundaryAligner:
+    """
+    Aligns boundaries between simplified partitions as per the paper.
+    """
+    
+    @staticmethod
+    def align_boundaries(submeshes: List[Dict], original_vertices: np.ndarray, 
+                        border_vertices_global: Set[int]) -> List[Dict]:
+        """
+        Align boundaries between partitions after simplification.
+        
+        Args:
+            submeshes: List of simplified submeshes
+            original_vertices: Original mesh vertices
+            border_vertices_global: Global border vertices set
+            
+        Returns:
+            List of submeshes with aligned boundaries
+        """
+        print("  Aligning boundaries between partitions...")
+        
+        # Build a mapping of border vertices across partitions
+        # Key: original global vertex index, Value: list of (submesh_idx, local_idx, position)
+        border_vertex_instances = {}
+        
+        for submesh_idx, submesh in enumerate(submeshes):
+            vertices = submesh['vertices']
+            reverse_map = submesh.get('reverse_map', {})
+            
+            for local_idx, vertex in enumerate(vertices):
+                # Check if this corresponds to a border vertex in the original mesh
+                original_global_idx = reverse_map.get(local_idx)
+                if original_global_idx is not None and original_global_idx in border_vertices_global:
+                    if original_global_idx not in border_vertex_instances:
+                        border_vertex_instances[original_global_idx] = []
+                    border_vertex_instances[original_global_idx].append(
+                        (submesh_idx, local_idx, vertex.copy())
+                    )
+        
+        # For each border vertex that appears in multiple partitions, 
+        # compute average position and update all instances
+        alignment_count = 0
+        for original_idx, instances in border_vertex_instances.items():
+            if len(instances) > 1:
+                # Compute average position
+                positions = [inst[2] for inst in instances]
+                avg_position = np.mean(positions, axis=0)
+                
+                # Update all instances to use the average position
+                for submesh_idx, local_idx, _ in instances:
+                    submeshes[submesh_idx]['vertices'][local_idx] = avg_position
+                
+                alignment_count += 1
+        
+        print(f"    Aligned {alignment_count} border vertices across partitions")
+        
+        return submeshes
 
 
 class MeshMerger:
@@ -412,7 +585,7 @@ def simplify_mesh_with_partitioning(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_ratio: float = 0.5,
-    num_partitions: int = 8
+    target_edges_per_partition: int = 200
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Simplify a mesh using partitioning, local simplification, and merging.
@@ -421,7 +594,7 @@ def simplify_mesh_with_partitioning(
         vertices: Input mesh vertices (N x 3)
         faces: Input mesh faces (M x 3)
         target_ratio: Target simplification ratio (0.5 = keep 50% of vertices)
-        num_partitions: Number of spatial partitions (default: 8 for octree)
+        target_edges_per_partition: Target number of edges per partition (default: 200)
         
     Returns:
         Tuple of (simplified_vertices, simplified_faces)
@@ -429,11 +602,12 @@ def simplify_mesh_with_partitioning(
     print(f"\n=== Starting Mesh Simplification with MDD/LME ===")
     print(f"Input mesh: {len(vertices)} vertices, {len(faces)} faces")
     print(f"Target ratio: {target_ratio}")
+    print(f"Target edges per partition: {target_edges_per_partition}")
     
     # Step 1: Partition the mesh
     print("\n[Step 1] Partitioning mesh...")
-    partitioner = MeshPartitioner(vertices, faces, num_partitions)
-    partitions = partitioner.partition_octree()
+    partitioner = MeshPartitioner(vertices, faces, target_edges_per_partition)
+    partitions = partitioner.partition_by_edge_count()
     print(f"Created {len(partitions)} non-empty partitions")
     print(f"Border vertices: {len(partitioner.border_vertices)}")
     
@@ -452,14 +626,21 @@ def simplify_mesh_with_partitioning(
         # Create reverse mapping (local to global)
         reverse_map = {local: global_idx for global_idx, local in vertex_map.items()}
         
-        # Identify border vertices in local indices
-        local_border_vertices = {vertex_map[v] for v in partition['is_border'] if v in vertex_map}
+        # Identify border vertices in local indices (partition borders, can be simplified)
+        local_border_vertices = {vertex_map[v] for v in partition['is_border'] 
+                                if v in vertex_map and v in partitioner.border_vertices}
+        
+        # Identify 2-ring extension vertices in local indices (should NOT be simplified)
+        local_two_ring_extension = {vertex_map[v] for v in partition['is_border'] 
+                                    if v in vertex_map and v not in partition['core_vertices'] 
+                                    and v not in partitioner.border_vertices}
         
         # Identify core vertices in local indices (vertices that belong to this partition's core)
         local_core_vertices = {vertex_map[v] for v in partition['core_vertices'] if v in vertex_map}
         
-        # Simplify the submesh using LME
-        simplifier = LMESimplifier(submesh_vertices, submesh_faces, local_border_vertices)
+        # Simplify the submesh using LME with boundary simplification enabled
+        simplifier = LMESimplifier(submesh_vertices, submesh_faces, 
+                                   local_border_vertices, local_two_ring_extension)
         simplified_vertices, simplified_faces = simplifier.simplify(target_ratio)
         
         # Filter faces to only include those with at least one vertex from the core
@@ -517,6 +698,12 @@ def simplify_mesh_with_partitioning(
             'reverse_map': simplified_reverse_map
         })
     
+    # Step 2.5: Align boundaries between partitions
+    print("\n[Step 2.5] Aligning boundaries...")
+    simplified_submeshes = BoundaryAligner.align_boundaries(
+        simplified_submeshes, vertices, partitioner.border_vertices
+    )
+    
     # Step 3: Merge simplified submeshes
     print("\n[Step 3] Merging simplified submeshes...")
     merger = MeshMerger()
@@ -536,7 +723,7 @@ def process_ply_file(
     input_path: str,
     output_path: str,
     target_ratio: float = 0.5,
-    num_partitions: int = 8
+    target_edges_per_partition: int = 200
 ) -> bool:
     """
     Process a single PLY file with partitioned mesh simplification.
@@ -545,7 +732,7 @@ def process_ply_file(
         input_path: Path to input PLY file
         output_path: Path to output PLY file
         target_ratio: Target simplification ratio
-        num_partitions: Number of spatial partitions
+        target_edges_per_partition: Target number of edges per partition
         
     Returns:
         True if successful, False otherwise
@@ -561,7 +748,7 @@ def process_ply_file(
         
         # Simplify using partitioning
         simplified_vertices, simplified_faces = simplify_mesh_with_partitioning(
-            vertices, faces, target_ratio, num_partitions
+            vertices, faces, target_ratio, target_edges_per_partition
         )
         
         # Write output mesh
@@ -593,7 +780,7 @@ def main():
     
     # Parameters
     simplification_ratio = 0.5  # Keep 50% of vertices
-    num_partitions = 8  # Octree partitioning (2x2x2)
+    target_edges_per_partition = 200  # Target edges per partition
     
     print("="*70)
     print("Mesh Simplification with MDD (Minimal Simplification Domain)")
@@ -603,7 +790,7 @@ def main():
     print(f"  Input folder:  {input_folder}")
     print(f"  Output folder: {output_folder}")
     print(f"  Simplification ratio: {simplification_ratio}")
-    print(f"  Number of partitions: {num_partitions}")
+    print(f"  Target edges per partition: {target_edges_per_partition}")
     
     # Create output directory
     os.makedirs(output_folder, exist_ok=True)
@@ -632,7 +819,7 @@ def main():
         output_filename = f"simplified_{filename}"
         output_path = os.path.join(output_folder, output_filename)
         
-        if process_ply_file(input_path, output_path, simplification_ratio, num_partitions):
+        if process_ply_file(input_path, output_path, simplification_ratio, target_edges_per_partition):
             successful += 1
         else:
             failed += 1
