@@ -112,8 +112,10 @@ class MeshPartitioner:
         Partition the mesh using BFS (Breadth-First Search) with target edge count.
         Creates partitions with approximately target_edges_per_partition edges and complete 2-ring neighborhoods.
         
-        According to the paper, boundary vertices are vertices at the intersection between different
-        sub-meshes and CAN be simplified. They need to be reconciled after simplification.
+        According to the paper:
+        - Boundary vertices (at intersections between sub-meshes) CAN be simplified
+        - 2-ring neighborhood vertices also CAN be simplified (their LME can be simplified)
+        - The 2-ring provides topological context for accurate QEM, but doesn't prevent simplification
         
         Each partition includes:
         - Core vertices: vertices in the partition
@@ -303,7 +305,7 @@ class LMESimplifier:
             vertices: Array of vertex coordinates
             faces: Array of face indices
             border_vertices: Set of vertex indices that are on partition borders (can be simplified)
-            two_ring_extension: Set of vertex indices in 2-ring extension (should not be simplified)
+            two_ring_extension: Set of vertex indices in 2-ring extension (can also be simplified per paper)
         """
         self.base_simplifier = QEMSimplifier(vertices, faces)
         self.border_vertices = border_vertices
@@ -315,28 +317,27 @@ class LMESimplifier:
         
     def simplify(self, target_ratio: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Simplify the mesh including boundary vertices, following the paper's approach.
-        Only 2-ring extension vertices are preserved.
+        Simplify the mesh including boundary and 2-ring vertices, following the paper's approach.
+        According to the paper, LME (Local Minimal Edges) within the 2-ring neighborhood can be simplified.
         
         Args:
             target_ratio: Target ratio of vertices to retain
             
         Returns:
-            Tuple of (simplified_vertices, simplified_faces)
+            Tuple of (simplified_vertices, simplified_faces, vertex_lineage)
         """
         # Calculate target vertex count
-        # Only 2-ring extension vertices are protected, border vertices can be simplified
-        num_protected = len(self.two_ring_extension)
+        # Per paper: All vertices can be simplified, including 2-ring extension
         num_total = len(self.base_simplifier.vertices)
-        num_simplifiable = num_total - num_protected
+        target_vertex_count = max(4, int(num_total * target_ratio))
         
-        # Target: keep all protected vertices plus a fraction of simplifiable vertices
-        target_simplifiable = max(4, int(num_simplifiable * target_ratio))
-        target_vertex_count = num_protected + target_simplifiable
+        num_border = len(self.border_vertices)
+        num_two_ring = len(self.two_ring_extension)
+        num_interior = num_total - num_border - num_two_ring
         
-        print(f"  LME Simplification: {num_total} vertices ({num_protected} protected 2-ring, "
-              f"{len(self.border_vertices)} border, {num_simplifiable - len(self.border_vertices)} interior)")
-        print(f"  Target: {target_vertex_count} vertices ({num_protected} protected, {target_simplifiable} simplifiable)")
+        print(f"  LME Simplification: {num_total} vertices ({num_two_ring} in 2-ring, "
+              f"{num_border} border, {num_interior} interior)")
+        print(f"  Target: {target_vertex_count} vertices (all can be simplified per paper)")
         
         # Find all valid edges
         edges = self.base_simplifier.find_valid_edges()
@@ -348,9 +349,6 @@ class LMESimplifier:
         
         for edge in edges:
             v1, v2 = edge
-            # Skip edges involving 2-ring extension vertices (these are truly protected)
-            if v1 in self.two_ring_extension or v2 in self.two_ring_extension:
-                continue
             
             if v1 not in self.base_simplifier.valid_vertices or v2 not in self.base_simplifier.valid_vertices:
                 continue
@@ -358,10 +356,12 @@ class LMESimplifier:
             optimal_pos = self.base_simplifier.compute_optimal_position(v1, v2)
             cost = self.base_simplifier.compute_cost(v1, v2, optimal_pos)
             
-            # Prioritize interior edges over boundary edges
-            # Boundary edges get a small penalty to prefer interior simplification first
-            if v1 in self.border_vertices or v2 in self.border_vertices:
-                cost *= 1.1  # Small penalty for boundary edges
+            # Prioritize interior edges, then boundary edges, then 2-ring extension edges
+            # Per paper: all can be simplified, but prefer interior simplification first
+            if v1 in self.two_ring_extension or v2 in self.two_ring_extension:
+                cost *= 1.2  # Lower priority for 2-ring extension edges
+            elif v1 in self.border_vertices or v2 in self.border_vertices:
+                cost *= 1.1  # Lower priority for boundary edges
             
             heapq.heappush(heap, (cost, v1, v2, optimal_pos))
         
@@ -377,10 +377,6 @@ class LMESimplifier:
             
             # Check if vertices are still valid
             if v1 not in self.base_simplifier.valid_vertices or v2 not in self.base_simplifier.valid_vertices:
-                continue
-            
-            # Double-check 2-ring extension vertices (shouldn't happen but safety check)
-            if v1 in self.two_ring_extension or v2 in self.two_ring_extension:
                 continue
             
             # Track if this involves border vertices for alignment
@@ -673,7 +669,8 @@ def simplify_mesh_with_partitioning(
         local_border_vertices = {vertex_map[v] for v in partition['is_border'] 
                                 if v in vertex_map and v in partitioner.border_vertices}
         
-        # Identify 2-ring extension vertices in local indices (should NOT be simplified)
+        # Identify 2-ring extension vertices in local indices (CAN be simplified per paper)
+        # These provide topological context but their LME can be simplified
         local_two_ring_extension = {vertex_map[v] for v in partition['is_border'] 
                                     if v in vertex_map and v not in partition['core_vertices'] 
                                     and v not in partitioner.border_vertices}
