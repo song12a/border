@@ -135,7 +135,7 @@ def test_partition_2ring_expansion():
     
     # Create partitioner with edge-based partitioning
     partitioner = MeshPartitioner(vertices, faces, target_edges_per_partition=50)
-    partitions = partitioner.partition_by_edge_count()
+    partitions = partitioner.partition_bfs()
     
     print(f"Created {len(partitions)} partitions")
     
@@ -165,7 +165,7 @@ def test_border_vertex_classification():
     vertices, faces = PLYReader.read_ply('demo/data/cube_subdivided.ply')
     
     partitioner = MeshPartitioner(vertices, faces, target_edges_per_partition=50)
-    partitions = partitioner.partition_by_edge_count()
+    partitions = partitioner.partition_bfs()
     
     print(f"Global border vertices: {len(partitioner.border_vertices)}")
     

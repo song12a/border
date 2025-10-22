@@ -107,21 +107,24 @@ class MeshPartitioner:
         
         return all_vertices
         
-    def partition_by_edge_count(self) -> List[Dict]:
+    def partition_bfs(self) -> List[Dict]:
         """
-        Partition the mesh based on target edge count with 2-ring neighborhood support.
-        Uses region growing to create partitions with approximately target_edges_per_partition edges.
+        Partition the mesh using BFS (Breadth-First Search) with target edge count.
+        Creates partitions with approximately target_edges_per_partition edges and complete 2-ring neighborhoods.
+        
+        According to the paper, boundary vertices are vertices at the intersection between different
+        sub-meshes and CAN be simplified. They need to be reconciled after simplification.
         
         Each partition includes:
         - Core vertices: vertices in the partition
-        - Extended vertices: vertices in the 2-ring neighborhood of core vertices
+        - Extended vertices: vertices in the 2-ring neighborhood of core vertices (MDD)
         
         Returns:
             List of partition dictionaries, each containing:
                 - 'vertices': all vertex indices in this partition (core + 2-ring)
                 - 'core_vertices': vertex indices in the core partition
                 - 'faces': face indices in this partition
-                - 'is_border': set of border vertices (shared with other partitions)
+                - 'is_border': set of border vertices (at intersections between partitions)
         """
         # Build adjacency and edge information
         if self.vertex_adjacency is None:
@@ -129,21 +132,25 @@ class MeshPartitioner:
         if self.edge_set is None:
             self.edge_set = self.build_edge_set()
         
-        # Build face-to-vertex mapping
-        vertex_faces = {i: [] for i in range(len(self.vertices))}
+        # Build face adjacency (faces sharing edges)
+        edge_faces = {}  # Maps edge tuple to list of face indices
         for face_idx, face in enumerate(self.faces):
-            for v in face:
-                vertex_faces[v].append(face_idx)
+            for i in range(3):
+                v1, v2 = face[i], face[(i + 1) % 3]
+                edge = (min(v1, v2), max(v1, v2))
+                if edge not in edge_faces:
+                    edge_faces[edge] = []
+                edge_faces[edge].append(face_idx)
         
         # Track which faces have been assigned to partitions
         assigned_faces = set()
         partition_data = []
         
-        print(f"  Partitioning mesh with target {self.target_edges_per_partition} edges per partition...")
+        print(f"  Partitioning mesh using BFS with target {self.target_edges_per_partition} edges per partition...")
         print(f"  Total edges in mesh: {len(self.edge_set)}")
         
         while len(assigned_faces) < len(self.faces):
-            # Find an unassigned face to start a new partition
+            # Find an unassigned face as seed for BFS
             seed_face = None
             for face_idx in range(len(self.faces)):
                 if face_idx not in assigned_faces:
@@ -153,12 +160,14 @@ class MeshPartitioner:
             if seed_face is None:
                 break
             
-            # Grow partition from seed face using region growing
-            core_vertices = set(self.faces[seed_face])
-            core_faces = {seed_face}
+            # BFS to grow partition
+            from collections import deque
+            queue = deque([seed_face])
+            core_faces = set()
+            core_vertices = set()
             assigned_faces.add(seed_face)
             
-            # Count edges in current partition
+            # Helper function to count edges in partition
             def count_edges_in_partition(vertices_set):
                 edge_count = 0
                 for v1, v2 in self.edge_set:
@@ -166,52 +175,36 @@ class MeshPartitioner:
                         edge_count += 1
                 return edge_count
             
-            # Frontier: faces adjacent to current partition
-            frontier = set()
-            for v in core_vertices:
-                for f_idx in vertex_faces[v]:
-                    if f_idx not in assigned_faces and f_idx not in core_faces:
-                        frontier.add(f_idx)
-            
-            # Grow partition until target edge count is reached
-            while len(frontier) > 0:
+            # BFS expansion
+            while queue:
+                current_face_idx = queue.popleft()
+                current_face = self.faces[current_face_idx]
+                
+                # Add face to core
+                core_faces.add(current_face_idx)
+                core_vertices.update(current_face)
+                
+                # Check if we should continue growing
                 current_edge_count = count_edges_in_partition(core_vertices)
                 
-                # Check if we've reached target edge count (with some tolerance)
-                if current_edge_count >= self.target_edges_per_partition * 0.8:
-                    # Don't exceed target by too much
-                    if current_edge_count >= self.target_edges_per_partition * 1.2:
-                        break
-                
-                # Find the best face to add from frontier
-                # Choose face that shares most vertices with current partition
-                best_face = None
-                best_shared_vertices = 0
-                
-                for f_idx in frontier:
-                    face = self.faces[f_idx]
-                    shared = sum(1 for v in face if v in core_vertices)
-                    if shared > best_shared_vertices:
-                        best_shared_vertices = shared
-                        best_face = f_idx
-                
-                if best_face is None:
+                # Stop if we've reached target (with tolerance)
+                if current_edge_count >= self.target_edges_per_partition * 1.2:
                     break
                 
-                # Add the best face to partition
-                face = self.faces[best_face]
-                core_vertices.update(face)
-                core_faces.add(best_face)
-                assigned_faces.add(best_face)
-                frontier.remove(best_face)
-                
-                # Update frontier
-                for v in face:
-                    for f_idx in vertex_faces[v]:
-                        if f_idx not in assigned_faces and f_idx not in core_faces:
-                            frontier.add(f_idx)
+                # Only continue BFS if below target
+                if current_edge_count < self.target_edges_per_partition * 0.8:
+                    # Find adjacent faces through shared edges
+                    for i in range(3):
+                        v1, v2 = current_face[i], current_face[(i + 1) % 3]
+                        edge = (min(v1, v2), max(v1, v2))
+                        
+                        if edge in edge_faces:
+                            for neighbor_face_idx in edge_faces[edge]:
+                                if neighbor_face_idx not in assigned_faces and neighbor_face_idx != current_face_idx:
+                                    assigned_faces.add(neighbor_face_idx)
+                                    queue.append(neighbor_face_idx)
             
-            # Create partition with 2-ring neighborhood
+            # Create partition with 2-ring neighborhood (MDD requirement)
             extended_vertices = self.compute_n_ring_neighborhood(core_vertices, n=2)
             
             # Find all faces that are fully contained in extended vertices
@@ -233,29 +226,33 @@ class MeshPartitioner:
             print(f"    Partition {len(partition_data)}: {len(core_vertices)} core vertices, "
                   f"{len(extended_vertices)} total vertices (2-ring), {edge_count} edges, {len(partition_faces)} faces")
         
-        # Identify border vertices (vertices shared between core partitions)
+        # Identify border vertices according to paper definition:
+        # Vertices at the intersection between different sub-meshes (core partitions)
         vertex_partition_count = {i: 0 for i in range(len(self.vertices))}
         for p in partition_data:
             for v in p['core_vertices']:
                 vertex_partition_count[v] += 1
         
+        # Border vertices are those in multiple core partitions
         for v, count in vertex_partition_count.items():
             if count > 1:
                 self.border_vertices.add(v)
         
         # Mark border vertices in each partition
+        # According to paper: boundary vertices CAN be simplified
         for p_idx, p_data in enumerate(partition_data):
             for v in p_data['vertices']:
-                # If vertex is not in this partition's core, it's part of the 2-ring extension
+                # Vertices not in core are part of 2-ring extension (should NOT be simplified)
                 if v not in p_data['core_vertices']:
                     p_data['is_border'].add(v)
-                # If vertex is in the core but belongs to multiple partitions
+                # Vertices in core but shared between partitions are boundary vertices (CAN be simplified)
+                # We mark them but they are still simplifiable
                 elif v in self.border_vertices:
                     p_data['is_border'].add(v)
         
         self.partitions = partition_data
         print(f"  Created {len(partition_data)} partitions")
-        print(f"  Border vertices: {len(self.border_vertices)}")
+        print(f"  Border vertices (at partition intersections): {len(self.border_vertices)}")
         
         return self.partitions
     
@@ -653,7 +650,7 @@ def simplify_mesh_with_partitioning(
     # Step 1: Partition the mesh
     print("\n[Step 1] Partitioning mesh...")
     partitioner = MeshPartitioner(vertices, faces, target_edges_per_partition)
-    partitions = partitioner.partition_by_edge_count()
+    partitions = partitioner.partition_bfs()
     print(f"Created {len(partitions)} non-empty partitions")
     print(f"Border vertices: {len(partitioner.border_vertices)}")
     
