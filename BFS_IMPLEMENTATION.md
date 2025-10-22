@@ -41,8 +41,9 @@ Replaced the previous region-growing approach with an explicit BFS algorithm:
   
 - **2-ring extension vertices**: Topology padding vertices
   - Not in core partition but in 2-ring neighborhood
-  - **CANNOT be simplified** (protected)
-  - Provide topological context for accurate QEM
+  - **CAN ALSO be simplified** (their LME can be simplified per paper)
+  - Provide topological context for accurate QEM but don't prevent simplification
+  - Get lower priority (1.2x cost penalty) for quality control
 
 ### 3. Boundary Reconciliation
 
